@@ -176,6 +176,8 @@
           mapped[index] = sanitizeChat(summary, detail, detail?.chatProfile?._id || null, false);
         } catch {
           const saved = cache?.[chatId];
+          // Keep a known previous mapping visible, but mark failures stale so they are not
+          // considered fresh cache entries on the next load and can be retried.
           mapped[index] = sanitizeChat(summary, null, saved?.chatProfileId || null, true);
           failedChatIds.push(chatId);
         } finally {

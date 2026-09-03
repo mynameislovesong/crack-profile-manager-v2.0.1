@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Crack 프로필 관리 보조",
+  "version": "2.0.1",
+  "description": "대화 프로필별 연결 채팅·메모·색상·순서·일괄 편집을 프로필 목록에서 관리합니다.",
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://crack.wrtn.ai/*"
+      ],
+      "js": [
+        "core.js",
+        "bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://crack.wrtn.ai/*"
+      ],
+      "js": [
+        "core.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

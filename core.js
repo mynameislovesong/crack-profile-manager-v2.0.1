@@ -92,6 +92,8 @@
     }
     if (typeof value !== "object") return "";
 
+    // Crack chat payloads can expose the preview as a string or as a small message object.
+    // Only inspect text-bearing fields; never stringify the whole object into "[object Object]".
     for (const key of ["content", "text", "message", "body", "value"]) {
       if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
       const text = messageText(value[key], depth + 1);
