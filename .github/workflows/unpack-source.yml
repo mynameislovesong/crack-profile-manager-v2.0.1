@@ -1,0 +1,31 @@
+name: Unpack source archive
+
+on:
+  push:
+    paths:
+      - source.ready
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild archive
+        run: |
+          cat source.part*.b64 > source.b64
+          base64 -d source.b64 > source.zip
+          unzip -o source.zip -d .
+          rm -f source.b64 source.zip source.part*.b64 source.ready
+      - name: Commit unpacked files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Unpack extension source"
+          git push
