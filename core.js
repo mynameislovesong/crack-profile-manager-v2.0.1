@@ -80,6 +80,48 @@
     return `${normalized.slice(0, max).trimEnd()}…`;
   }
 
+  function normalizeSearchText(value) {
+    return String(value ?? "")
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function tagKey(value) {
+    return normalizeSearchText(value);
+  }
+
+  function normalizeTagList(values) {
+    const result = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(values) ? values : []) {
+      const label = String(raw ?? "").normalize("NFKC").replace(/\s+/g, " ").trim();
+      const key = tagKey(label);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(label);
+    }
+    return result;
+  }
+
+  function matchesProfileFilters(profile, settings, searchQuery, selectedTags) {
+    const query = normalizeSearchText(searchQuery);
+    if (query) {
+      const haystack = normalizeSearchText([
+        profile?.name || "",
+        profile?.information || "",
+        settings?.text || ""
+      ].join(" "));
+      if (!haystack.includes(query)) return false;
+    }
+
+    const required = normalizeTagList(selectedTags).map(tagKey);
+    if (!required.length) return true;
+    const owned = new Set(normalizeTagList(settings?.tags).map(tagKey));
+    return required.every((key) => owned.has(key));
+  }
+
   function messageText(value, depth = 0) {
     if (value == null || depth > 4) return "";
     if (typeof value === "string" || typeof value === "number") return String(value);
@@ -203,10 +245,14 @@
     formatChatTime,
     isProfilePage,
     makeChatCache,
+    matchesProfileFilters,
     mergeProfileOrder,
     moveProfile,
+    normalizeSearchText,
+    normalizeTagList,
     notePreview,
     planChatDetails,
-    routeForChat
+    routeForChat,
+    tagKey
   };
 });
