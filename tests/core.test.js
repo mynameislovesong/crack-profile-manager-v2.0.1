@@ -131,3 +131,33 @@ test("상세 조회 실패로 stale 표시된 채팅은 캐시에 남기지 않�
   assert.ok(cache.ok);
   assert.equal(cache.failed, undefined);
 });
+
+test("태그 이름은 공백/유니코드를 정리하고 대소문자 중복을 하나로 합친다", () => {
+  assert.deepEqual(core.normalizeTagList([" 남 ", "AU", "au", "인외", "  "]), ["남", "AU", "인외"]);
+  assert.equal(core.tagKey("  ＡＵ  "), "au");
+});
+
+test("검색은 프로필 이름/설명/메모를 대소문자 구분 없이 부분 검색한다", () => {
+  const profile = { name: "Latch", information: "남성 인외 캐릭터" };
+  const settings = { text: "히사카 AU용", tags: ["남", "인외"] };
+  assert.equal(core.matchesProfileFilters(profile, settings, "lat", []), true);
+  assert.equal(core.matchesProfileFilters(profile, settings, "인외", []), true);
+  assert.equal(core.matchesProfileFilters(profile, settings, "히사카", []), true);
+  assert.equal(core.matchesProfileFilters(profile, settings, "없는검색어", []), false);
+});
+
+test("다중 태그 필터는 OR이 아니라 모든 태그를 요구하는 AND로 동작한다", () => {
+  const profile = { name: "래치", information: "" };
+  assert.equal(core.matchesProfileFilters(profile, { tags: ["남", "인외"] }, "", ["남"]), true);
+  assert.equal(core.matchesProfileFilters(profile, { tags: ["남", "인외"] }, "", ["남", "인외"]), true);
+  assert.equal(core.matchesProfileFilters(profile, { tags: ["남"] }, "", ["남", "인외"]), false);
+  assert.equal(core.matchesProfileFilters(profile, { tags: ["인외"] }, "", ["남", "인외"]), false);
+});
+
+test("검색어와 다중 태그 조건도 함께 AND로 적용된다", () => {
+  const profile = { name: "래치", information: "방독면" };
+  const settings = { text: "AU", tags: ["남", "인외"] };
+  assert.equal(core.matchesProfileFilters(profile, settings, "래치", ["남", "인외"]), true);
+  assert.equal(core.matchesProfileFilters(profile, settings, "다른 이름", ["남", "인외"]), false);
+  assert.equal(core.matchesProfileFilters(profile, settings, "래치", ["여"]), false);
+});
