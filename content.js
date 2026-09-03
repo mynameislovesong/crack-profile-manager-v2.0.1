@@ -9,6 +9,9 @@
   const NOTES_KEY = "crackProfileConnectionNotesV1";
   const INDEX_CACHE_KEY = "crackProfileConnectionIndexV1";
   const ORDER_KEY = "crackProfileOrderV2";
+  const TAGS_KEY = "crackProfileTagsV1";
+  const DEFAULT_TAGS = ["남", "여", "인외"];
+  const LEGACY_DEFAULT_TAGS = ["남", "여", "인외", "기타"];
   const OWNED_SELECTOR = "[data-cpci-owned]";
   const CARD_SELECTOR = "div.bg-surface_tertiary.rounded-lg.p-4";
   const core = window.CrackProfileChatCore;
@@ -37,6 +40,7 @@
   let notes = {};
   let indexCache = {};
   let orderStore = {};
+  let globalTags = [...DEFAULT_TAGS];
   let ownerProfileId = "";
   let profiles = [];
   let chats = [];
@@ -50,6 +54,7 @@
   let lastUrl = location.href;
   let settingsWriteQueue = Promise.resolve();
   let orderWriteQueue = Promise.resolve();
+  let tagWriteQueue = Promise.resolve();
   let editMode = false;
   let deleting = false;
   let pendingDelete = null;
@@ -57,15 +62,40 @@
   let openPalette = null;
   let activeDragId = "";
   let statusOverride = null;
+  let searchQuery = "";
+  let searchTimer = null;
   const selectedIds = new Set();
+  const selectedTagKeys = new Set();
   const noteTimers = new Map();
 
-  const storageReady = chrome.storage.local.get([NOTES_KEY, INDEX_CACHE_KEY, ORDER_KEY]).then((stored) => {
+  const storageReady = chrome.storage.local.get([NOTES_KEY, INDEX_CACHE_KEY, ORDER_KEY, TAGS_KEY]).then(async (stored) => {
     notes = stored[NOTES_KEY] && typeof stored[NOTES_KEY] === "object" ? stored[NOTES_KEY] : {};
     indexCache = stored[INDEX_CACHE_KEY] && typeof stored[INDEX_CACHE_KEY] === "object"
       ? stored[INDEX_CACHE_KEY]
       : {};
     orderStore = stored[ORDER_KEY] && typeof stored[ORDER_KEY] === "object" ? stored[ORDER_KEY] : {};
+    if (Array.isArray(stored[TAGS_KEY])) {
+      globalTags = core.normalizeTagList(stored[TAGS_KEY]);
+
+      // 2.1.0의 기본 태그였던 "기타"는 2.1.1부터 기본값에서 제외한다.
+      // 사용자가 실제로 "기타"를 프로필에 지정했다면 사용자 태그로 간주해 보존한다.
+      const legacyKeys = new Set(LEGACY_DEFAULT_TAGS.map(core.tagKey));
+      const storedKeys = new Set(globalTags.map(core.tagKey));
+      const miscKey = core.tagKey("기타");
+      const hasLegacyDefaults = [...legacyKeys].every((key) => storedKeys.has(key));
+      const miscIsAssigned = Object.values(notes).some((settings) => {
+        const value = typeof settings === "string" ? {} : settings;
+        return core.normalizeTagList(value?.tags).some((tag) => core.tagKey(tag) === miscKey);
+      });
+
+      if (hasLegacyDefaults && !miscIsAssigned) {
+        globalTags = globalTags.filter((tag) => core.tagKey(tag) !== miscKey);
+        await chrome.storage.local.set({ [TAGS_KEY]: globalTags });
+      }
+    } else {
+      globalTags = [...DEFAULT_TAGS];
+      await chrome.storage.local.set({ [TAGS_KEY]: globalTags });
+    }
   });
 
   function post(type, payload = {}) {
@@ -99,6 +129,18 @@
     return CARD_COLOR_KEYS.has(key) ? key : "default";
   }
 
+  function canonicalTagLabel(value) {
+    const key = core.tagKey(value);
+    if (!key) return "";
+    return globalTags.find((tag) => core.tagKey(tag) === key) || "";
+  }
+
+  function profileTags(profileId) {
+    return core.normalizeTagList(normalizedSettings(profileId).tags)
+      .map(canonicalTagLabel)
+      .filter(Boolean);
+  }
+
   function cleanSettings(value) {
     const next = { ...value };
     if (!String(next.text || "").trim()) {
@@ -107,6 +149,9 @@
     }
     if (!MEMO_COLOR_KEYS.has(next.memoColor) || next.memoColor === "default") delete next.memoColor;
     if (!CARD_COLOR_KEYS.has(next.cardColor) || next.cardColor === "default") delete next.cardColor;
+    const tags = core.normalizeTagList(next.tags).map(canonicalTagLabel).filter(Boolean);
+    if (tags.length) next.tags = tags;
+    else delete next.tags;
     return next;
   }
 
@@ -173,6 +218,312 @@
     }
   }
 
+  function visibleProfileIds() {
+    const host = findCardsHost();
+    if (!host) return [];
+    const visible = new Set(
+      getCards(host)
+        .filter((card) => card.dataset.cpciFilteredOut !== "true")
+        .map((card) => card.dataset.cpciProfileId)
+        .filter(Boolean)
+    );
+    return orderedIds.filter((id) => visible.has(id));
+  }
+
+  function currentFilterTags() {
+    return globalTags.filter((tag) => selectedTagKeys.has(core.tagKey(tag)));
+  }
+
+  function applyFilters() {
+    const host = findCardsHost();
+    if (!host) return;
+    const byId = new Map(profiles.map((profile) => [profile._id, profile]));
+    const requiredTags = currentFilterTags();
+    const visible = new Set();
+
+    for (const card of getCards(host)) {
+      const profileId = card.dataset.cpciProfileId;
+      const profile = byId.get(profileId);
+      const matches = Boolean(profile) && core.matchesProfileFilters(
+        profile,
+        normalizedSettings(profileId),
+        searchQuery,
+        requiredTags
+      );
+      card.dataset.cpciFilteredOut = String(!matches);
+      if (matches) visible.add(profileId);
+    }
+
+    if (editMode) {
+      for (const id of [...selectedIds]) {
+        if (!visible.has(id)) selectedIds.delete(id);
+      }
+    }
+    updateFilterUi(visible.size);
+    if (editMode) updateEditUi();
+  }
+
+  function updateFilterUi(visibleCount) {
+    const bar = document.querySelector(".cpci-filter-tools");
+    if (!bar) return;
+    const input = bar.querySelector(".cpci-profile-search");
+    if (input && document.activeElement !== input && input.value !== searchQuery) input.value = searchQuery;
+    const count = bar.querySelector(".cpci-filter-count");
+    const shown = Number.isInteger(visibleCount) ? visibleCount : visibleProfileIds().length;
+    if (count) count.textContent = `${shown} / ${profiles.length}`;
+
+    const row = bar.querySelector(".cpci-tag-filters");
+    if (!row) return;
+    const all = createElement("button", "cpci-filter-chip cpci-filter-all", "전체");
+    all.type = "button";
+    all.setAttribute("aria-pressed", String(selectedTagKeys.size === 0));
+    all.addEventListener("click", () => {
+      selectedTagKeys.clear();
+      applyFilters();
+    });
+    row.replaceChildren(all);
+
+    for (const tag of globalTags) {
+      const key = core.tagKey(tag);
+      const button = createElement("button", "cpci-filter-chip", tag);
+      button.type = "button";
+      button.dataset.tagKey = key;
+      button.title = tag;
+      button.setAttribute("aria-pressed", String(selectedTagKeys.has(key)));
+      button.addEventListener("click", () => {
+        if (selectedTagKeys.has(key)) selectedTagKeys.delete(key);
+        else selectedTagKeys.add(key);
+        applyFilters();
+      });
+      row.append(button);
+    }
+  }
+
+  function ensureFilterBar() {
+    const header = findHeaderContainer();
+    if (!header) return null;
+    let bar = header.querySelector(":scope > .cpci-filter-tools");
+    if (bar) return bar;
+
+    bar = createElement("section", "cpci-filter-tools");
+    bar.dataset.cpciOwned = "true";
+    const searchRow = createElement("div", "cpci-search-row");
+    const input = createElement("input", "cpci-profile-search");
+    input.type = "search";
+    input.placeholder = "프로필 검색...";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("aria-label", "프로필 검색");
+    input.value = searchQuery;
+    const count = createElement("span", "cpci-filter-count", `0 / ${profiles.length}`);
+    const manage = createElement("button", "cpci-tag-manage-button", "+");
+    manage.type = "button";
+    manage.title = "태그 추가/관리";
+    manage.setAttribute("aria-label", "태그 추가 및 관리");
+    manage.addEventListener("click", () => openTagManager(manage.getBoundingClientRect()));
+    input.addEventListener("input", () => {
+      searchQuery = input.value;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(applyFilters, 120);
+    });
+    searchRow.append(input, count, manage);
+    const filters = createElement("div", "cpci-tag-filters");
+    filters.setAttribute("aria-label", "프로필 태그 필터");
+    bar.append(searchRow, filters);
+
+    const toolbar = header.querySelector(":scope > .cpci-edit-toolbar");
+    if (toolbar) header.insertBefore(bar, toolbar);
+    else header.append(bar);
+    updateFilterUi(0);
+    return bar;
+  }
+
+  function updateProfileTags(root, profileId) {
+    const container = root?.querySelector(".cpci-profile-tags");
+    if (!container) return;
+    const tags = profileTags(profileId);
+    container.replaceChildren();
+    container.hidden = tags.length === 0;
+    for (const tag of tags) {
+      const chip = createElement("span", "cpci-profile-tag", tag);
+      chip.title = tag;
+      container.append(chip);
+    }
+  }
+
+  function normalizeNewTag(value) {
+    return core.normalizeTagList([value])[0] || "";
+  }
+
+  function addGlobalTag(value) {
+    const label = normalizeNewTag(value);
+    if (!label) return Promise.resolve({ ok: false, reason: "empty" });
+    const key = core.tagKey(label);
+    if (globalTags.some((tag) => core.tagKey(tag) === key)) {
+      return Promise.resolve({ ok: false, reason: "duplicate" });
+    }
+    tagWriteQueue = tagWriteQueue.then(async () => {
+      if (globalTags.some((tag) => core.tagKey(tag) === key)) return { ok: false, reason: "duplicate" };
+      globalTags = [...globalTags, label];
+      await chrome.storage.local.set({ [TAGS_KEY]: globalTags });
+      updateFilterUi();
+      return { ok: true, label };
+    });
+    return tagWriteQueue;
+  }
+
+  function deleteGlobalTag(label) {
+    const key = core.tagKey(label);
+    if (!key) return Promise.resolve();
+    tagWriteQueue = tagWriteQueue.then(async () => {
+      if (!globalTags.some((tag) => core.tagKey(tag) === key)) return;
+      globalTags = globalTags.filter((tag) => core.tagKey(tag) !== key);
+      selectedTagKeys.delete(key);
+
+      const nextNotes = {};
+      for (const [profileId, rawValue] of Object.entries(notes)) {
+        const settings = typeof rawValue === "string" ? { text: rawValue } : { ...(rawValue || {}) };
+        if (Array.isArray(settings.tags)) {
+          settings.tags = settings.tags.filter((tag) => core.tagKey(tag) !== key);
+        }
+        const cleaned = cleanSettings(settings);
+        if (Object.keys(cleaned).length) nextNotes[profileId] = cleaned;
+      }
+      notes = nextNotes;
+      await chrome.storage.local.set({ [TAGS_KEY]: globalTags, [NOTES_KEY]: nextNotes });
+      profiles.forEach((profile) => refreshProfileVisuals(profile._id, false));
+      updateFilterUi();
+      applyFilters();
+    });
+    return tagWriteQueue;
+  }
+
+  function positionFloatingPalette(palette, anchor) {
+    document.body.append(palette);
+    const rect = palette.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, anchor.right - rect.width));
+    const below = anchor.bottom + 6;
+    const top = below + rect.height <= window.innerHeight - 8
+      ? below
+      : Math.max(8, anchor.top - rect.height - 6);
+    palette.style.left = `${left}px`;
+    palette.style.top = `${top}px`;
+    openPalette = palette;
+  }
+
+  function openTagManager(anchor) {
+    closeCardPalette();
+    const palette = createElement("div", "cpci-card-palette cpci-tag-manager");
+    palette.dataset.cpciOwned = "true";
+    palette.setAttribute("role", "dialog");
+    palette.setAttribute("aria-label", "태그 관리");
+    palette.append(createElement("p", "cpci-palette-title", "태그 관리"));
+
+    const form = createElement("form", "cpci-tag-add-form");
+    const input = createElement("input", "cpci-tag-name-input");
+    input.type = "text";
+    input.maxLength = 32;
+    input.placeholder = "새 태그 이름";
+    input.setAttribute("aria-label", "새 태그 이름");
+    const add = createElement("button", "cpci-tag-add-button", "추가");
+    add.type = "submit";
+    const status = createElement("p", "cpci-tag-manager-status", "");
+    form.append(input, add);
+    palette.append(form, status);
+
+    const list = createElement("div", "cpci-tag-manager-list");
+    const renderList = () => {
+      list.replaceChildren();
+      if (!globalTags.length) {
+        list.append(createElement("p", "cpci-tag-empty", "등록된 태그가 없습니다."));
+        return;
+      }
+      for (const tag of globalTags) {
+        const row = createElement("div", "cpci-tag-manager-row");
+        const label = createElement("span", "cpci-tag-manager-label", tag);
+        label.title = tag;
+        const remove = createElement("button", "cpci-tag-delete-button", "삭제");
+        remove.type = "button";
+        remove.setAttribute("aria-label", `${tag} 태그 삭제`);
+        remove.addEventListener("click", async () => {
+          if (!window.confirm(`“${tag}” 태그를 삭제할까요?\n이 태그는 모든 프로필에서 제거됩니다.`)) return;
+          remove.disabled = true;
+          try {
+            await deleteGlobalTag(tag);
+            renderList();
+          } catch {
+            status.textContent = "태그를 삭제하지 못했습니다.";
+          }
+        });
+        row.append(label, remove);
+        list.append(row);
+      }
+    };
+    renderList();
+    palette.append(list);
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const value = input.value;
+      add.disabled = true;
+      status.textContent = "";
+      try {
+        const result = await addGlobalTag(value);
+        if (!result.ok) {
+          status.textContent = result.reason === "duplicate" ? "이미 같은 이름의 태그가 있습니다." : "태그 이름을 입력해 주세요.";
+          return;
+        }
+        input.value = "";
+        renderList();
+      } catch {
+        status.textContent = "태그를 저장하지 못했습니다.";
+      } finally {
+        add.disabled = false;
+        input.focus({ preventScroll: true });
+      }
+    });
+
+    positionFloatingPalette(palette, anchor);
+    input.focus({ preventScroll: true });
+  }
+
+  function openTagPaletteFor(profileId, anchor) {
+    closeCardPalette();
+    const palette = createElement("div", "cpci-card-palette cpci-profile-tag-palette");
+    palette.dataset.cpciOwned = "true";
+    palette.dataset.profileId = profileId;
+    palette.setAttribute("role", "dialog");
+    palette.setAttribute("aria-label", "태그 설정");
+    palette.append(createElement("p", "cpci-palette-title", "태그 설정"));
+    const list = createElement("div", "cpci-profile-tag-options");
+    const selected = new Set(profileTags(profileId).map(core.tagKey));
+
+    if (!globalTags.length) {
+      list.append(createElement("p", "cpci-tag-empty", "등록된 태그가 없습니다. 상단 + 버튼에서 태그를 추가하세요."));
+    } else {
+      for (const tag of globalTags) {
+        const key = core.tagKey(tag);
+        const label = createElement("label", "cpci-profile-tag-option");
+        const checkbox = createElement("input", "cpci-profile-tag-checkbox");
+        checkbox.type = "checkbox";
+        checkbox.checked = selected.has(key);
+        const text = createElement("span", "cpci-profile-tag-option-label", tag);
+        label.append(checkbox, text);
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) selected.add(key);
+          else selected.delete(key);
+          const nextTags = globalTags.filter((item) => selected.has(core.tagKey(item)));
+          writeProfileSettings(profileId, (settings) => ({ ...settings, tags: nextTags }))
+            .catch(() => updateGlobalStatus("태그 설정을 저장하지 못했습니다.", true));
+        });
+        list.append(label);
+      }
+    }
+    palette.append(list);
+    positionFloatingPalette(palette, anchor);
+    palette.querySelector("input, button")?.focus({ preventScroll: true });
+  }
+
   function createMemoColorPicker(profile, root) {
     const picker = createElement("div", "cpci-memo-colors");
     picker.setAttribute("role", "group");
@@ -200,6 +551,9 @@
     root.dataset.cpciOwned = "true";
     root.dataset.cpciProfileId = profile._id;
     shieldCardClick(root);
+
+    const tagList = createElement("div", "cpci-profile-tags");
+    tagList.hidden = true;
 
     const chatToggle = createElement("button", "cpci-row cpci-chat-toggle");
     chatToggle.type = "button";
@@ -265,7 +619,7 @@
     });
     textarea.addEventListener("blur", () => flushNote(profile._id, textarea, saveStatus, root));
 
-    root.append(chatToggle, chatPanel, noteToggle, notePanel);
+    root.append(tagList, chatToggle, chatPanel, noteToggle, notePanel);
     return root;
   }
 
@@ -401,6 +755,7 @@
 
   function updateTools(root, profile) {
     root.dataset.cpciProfileId = profile._id;
+    updateProfileTags(root, profile._id);
     updateChatPanel(root, profile);
     updateNoteSummary(root, profile._id);
   }
@@ -411,12 +766,16 @@
     else card.dataset.cpciCardColor = key;
   }
 
-  function refreshProfileVisuals(profileId) {
+  function refreshProfileVisuals(profileId, reapplyFilters = true) {
     const card = cardForProfile(profileId);
     if (!card) return;
     applyCardColor(card, profileId);
     const root = card.querySelector(":scope .cpci-profile-tools");
-    if (root) updateNoteSummary(root, profileId);
+    if (root) {
+      updateNoteSummary(root, profileId);
+      updateProfileTags(root, profileId);
+    }
+    if (reapplyFilters) applyFilters();
   }
 
   function createEditControls(profile) {
@@ -507,10 +866,11 @@
     handle.addEventListener("keydown", (event) => {
       if (!editMode || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
       event.preventDefault();
-      const index = orderedIds.indexOf(profileId);
+      const visibleOrder = visibleProfileIds();
+      const index = visibleOrder.indexOf(profileId);
       const otherIndex = event.key === "ArrowUp" ? index - 1 : index + 1;
-      if (index < 0 || otherIndex < 0 || otherIndex >= orderedIds.length) return;
-      orderedIds = core.moveProfile(orderedIds, profileId, orderedIds[otherIndex], event.key === "ArrowDown");
+      if (index < 0 || otherIndex < 0 || otherIndex >= visibleOrder.length) return;
+      orderedIds = core.moveProfile(orderedIds, profileId, visibleOrder[otherIndex], event.key === "ArrowDown");
       applyOrder();
       persistOrder();
       handle.focus();
@@ -557,7 +917,7 @@
     selectAll.type = "button";
     selectAll.dataset.action = "select-all";
     selectAll.addEventListener("click", () => {
-      profiles.forEach((profile) => selectedIds.add(profile._id));
+      visibleProfileIds().forEach((id) => selectedIds.add(id));
       updateEditUi();
     });
     const clearAll = createElement("button", "cpci-toolbar-button", "전체 해제");
@@ -602,7 +962,9 @@
         remove.textContent = selectedIds.size ? `${selectedIds.size}개 삭제` : "선택 삭제";
         remove.disabled = !selectedIds.size || deleting;
       }
-      if (selectAll) selectAll.disabled = deleting || selectedIds.size === profiles.length;
+      const visibleIds = visibleProfileIds();
+      const selectedVisibleCount = visibleIds.filter((id) => selectedIds.has(id)).length;
+      if (selectAll) selectAll.disabled = deleting || visibleIds.length === 0 || selectedVisibleCount === visibleIds.length;
       if (clearAll) clearAll.disabled = deleting || selectedIds.size === 0;
       if (toggle) toggle.disabled = deleting;
     }
@@ -674,6 +1036,7 @@
 
   function render() {
     if (!isOnProfilePage()) return;
+    ensureFilterBar();
     ensureToolbar();
     const host = findCardsHost();
     const cards = getCards(host);
@@ -699,6 +1062,7 @@
       applyCardColor(card, profile._id);
     });
     applyOrder();
+    applyFilters();
     updateEditUi();
     injectColorMenuItems();
     renderStatus();
@@ -752,28 +1116,52 @@
   function injectColorMenuItems() {
     if (!menuProfileId) return;
     for (const menu of document.querySelectorAll('[role="menu"]')) {
-      if (menu.querySelector(".cpci-card-color-menu-item")) continue;
       const items = [...menu.querySelectorAll(':scope > [role="menuitem"]')];
       const deleteItem = items.find((item) => item.textContent.trim() === "삭제하기");
       if (!deleteItem) continue;
-      const item = createElement("div", `${deleteItem.className} cpci-card-color-menu-item`, "카드 색상 변경");
-      item.dataset.cpciOwned = "true";
-      item.setAttribute("role", "menuitem");
-      item.setAttribute("tabindex", "-1");
-      const activate = (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const rect = item.getBoundingClientRect();
-        const profileId = menuProfileId;
-        openCardPaletteFor(profileId, rect);
-        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-      };
-      item.addEventListener("pointerdown", (event) => event.stopPropagation());
-      item.addEventListener("click", activate);
-      item.addEventListener("keydown", (event) => {
-        if (["Enter", " "].includes(event.key)) activate(event);
-      });
-      deleteItem.after(item);
+
+      let colorItem = menu.querySelector(".cpci-card-color-menu-item");
+      if (!colorItem) {
+        colorItem = createElement("div", `${deleteItem.className} cpci-card-color-menu-item`, "카드 색상 변경");
+        colorItem.dataset.cpciOwned = "true";
+        colorItem.setAttribute("role", "menuitem");
+        colorItem.setAttribute("tabindex", "-1");
+        const activateColor = (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = colorItem.getBoundingClientRect();
+          const profileId = menuProfileId;
+          openCardPaletteFor(profileId, rect);
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        };
+        colorItem.addEventListener("pointerdown", (event) => event.stopPropagation());
+        colorItem.addEventListener("click", activateColor);
+        colorItem.addEventListener("keydown", (event) => {
+          if (["Enter", " "].includes(event.key)) activateColor(event);
+        });
+        deleteItem.after(colorItem);
+      }
+
+      if (!menu.querySelector(".cpci-tag-menu-item")) {
+        const tagItem = createElement("div", `${deleteItem.className} cpci-tag-menu-item`, "태그 설정");
+        tagItem.dataset.cpciOwned = "true";
+        tagItem.setAttribute("role", "menuitem");
+        tagItem.setAttribute("tabindex", "-1");
+        const activateTags = (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = tagItem.getBoundingClientRect();
+          const profileId = menuProfileId;
+          openTagPaletteFor(profileId, rect);
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        };
+        tagItem.addEventListener("pointerdown", (event) => event.stopPropagation());
+        tagItem.addEventListener("click", activateTags);
+        tagItem.addEventListener("keydown", (event) => {
+          if (["Enter", " "].includes(event.key)) activateTags(event);
+        });
+        colorItem.after(tagItem);
+      }
     }
   }
 
@@ -886,16 +1274,31 @@
   }, true);
 
   window.addEventListener("resize", closeCardPalette);
-  window.addEventListener("scroll", closeCardPalette, true);
+  window.addEventListener("scroll", (event) => {
+    if (openPalette && event.target instanceof Node && openPalette.contains(event.target)) return;
+    closeCardPalette();
+  }, true);
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
+    if (changes[TAGS_KEY]) {
+      globalTags = Array.isArray(changes[TAGS_KEY].newValue)
+        ? core.normalizeTagList(changes[TAGS_KEY].newValue)
+        : [];
+      const validKeys = new Set(globalTags.map(core.tagKey));
+      for (const key of [...selectedTagKeys]) {
+        if (!validKeys.has(key)) selectedTagKeys.delete(key);
+      }
+      profiles.forEach((profile) => refreshProfileVisuals(profile._id, false));
+      updateFilterUi();
+    }
     if (changes[NOTES_KEY]) {
       notes = changes[NOTES_KEY].newValue && typeof changes[NOTES_KEY].newValue === "object"
         ? changes[NOTES_KEY].newValue
         : {};
-      profiles.forEach((profile) => refreshProfileVisuals(profile._id));
+      profiles.forEach((profile) => refreshProfileVisuals(profile._id, false));
     }
+    if (changes[TAGS_KEY] || changes[NOTES_KEY]) applyFilters();
     if (changes[ORDER_KEY]) {
       orderStore = changes[ORDER_KEY].newValue && typeof changes[ORDER_KEY].newValue === "object"
         ? changes[ORDER_KEY].newValue
